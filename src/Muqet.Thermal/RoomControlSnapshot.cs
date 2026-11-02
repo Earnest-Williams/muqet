@@ -55,8 +55,9 @@ public static class RoomControlSnapshotBuilder
         if (maxCellsPerZone < 1 || maxCellsPerZone > VirtualControlZoneBuilder.MaximumZoneCapacity)
             throw new ArgumentOutOfRangeException(nameof(maxCellsPerZone));
 
+        int[] roomIds = roomIdsByCell.ToArray();
         for (int i = 0; i < n; i++)
-            if (roomIdsByCell[i] < -1)
+            if (roomIds[i] < -1)
                 throw new ArgumentException("Room IDs must be -1 or nonnegative.", nameof(roomIdsByCell));
 
         var ordered = devices.ToArray();
@@ -72,7 +73,7 @@ public static class RoomControlSnapshotBuilder
         Mix(width);
         Mix(height);
         Mix(maxCellsPerZone);
-        foreach (int roomId in roomIdsByCell) Mix(roomId);
+        foreach (int roomId in roomIds) Mix(roomId);
 
         for (int i = 0; i < ordered.Length; i++)
         {
@@ -88,7 +89,7 @@ public static class RoomControlSnapshotBuilder
             Mix(device.BaseCell);
             Mix(device.PreferredOutletCell);
 
-            int resolved = ChooseFreeCell(device, width, height, roomIdsByCell, used);
+            int resolved = ChooseFreeCell(device, width, height, roomIds, used);
             if (resolved < 0)
             {
                 skipped++;
@@ -96,17 +97,17 @@ public static class RoomControlSnapshotBuilder
             }
 
             used.Add(resolved);
-            anchors.Add(new ControlAnchor(device.ControllerId, roomIdsByCell[resolved], resolved));
+            anchors.Add(new ControlAnchor(device.ControllerId, roomIds[resolved], resolved));
         }
 
         ControlAnchor[] resolvedAnchors = anchors.ToArray();
         VirtualControlZoneLayout zones = VirtualControlZoneBuilder.Build(
-            width, height, roomIdsByCell, resolvedAnchors, maxCellsPerZone);
+            width, height, roomIds, resolvedAnchors, maxCellsPerZone);
         return new RoomControlSnapshot(zones, resolvedAnchors, skipped, hash);
     }
 
     private static int ChooseFreeCell(ControllerPlacement device, int width, int height,
-        ReadOnlySpan<int> rooms, HashSet<int> used)
+        int[] rooms, HashSet<int> used)
     {
         int origin = device.BaseCell;
         int preferred = device.PreferredOutletCell;
