@@ -20,7 +20,9 @@ despawns and changes that did not raise either notification.
    occupied cell and N/E/S/W neighbours), with deterministic ID collision
    handling. A candidate without a usable cell is skipped and counted.
 5. Build bounded 25-cell virtual control zones with the M2 solver-independent
-   builder. The result is held in a MapComponent with a generation counter.
+   builder. The result is held in a MapComponent with a generation counter. When RimWorld developer mode is enabled,
+changed snapshots log controller, zone, unserved-cell and skipped-device
+counts. This is diagnostic reporting only.
 
 The adapter is intentionally **observation-only**. It does not currently
 replace RimWorld temperature propagation, alter room temperatures, call
@@ -48,6 +50,15 @@ source cell on every vanilla/modded device.
 The native assembly output is configured under Mod/1.7/Assemblies.
 Copy Mod/ as a development mod after building. Do not package Harmony
 or RimWorld reference assemblies with the mod.
+
+## Important limitation
+
+The guarded room-shape hook may not find a matching notification method
+in a particular 1.7 build. In that case, the periodic safety scan still
+refreshes changed room IDs, but changes will not be detected immediately.
+Opening/closing a door without changing Room membership is NOT currently
+represented in the control-zone permeability field. M5 must capture door,
+vent and passage state before such changes can affect zone assignment.
 
 ## Runtime acceptance still needed
 

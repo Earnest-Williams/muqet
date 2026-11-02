@@ -40,6 +40,11 @@ public sealed class MuqetMapComponent : MapComponent
                 return;
             Snapshot = captured;
             SnapshotGeneration++;
+            if (Prefs.DevMode)
+                Log.Message($"[Muqet] map topology generation {SnapshotGeneration}: "
+                    + $"controllers={captured.Anchors.Count}, zones={captured.Zones.Zones.Count}, "
+                    + $"unserved cells={captured.Zones.UnservedCellCount}, "
+                    + $"skipped devices={captured.SkippedDeviceCount}");
         }
         catch (Exception e)
         {

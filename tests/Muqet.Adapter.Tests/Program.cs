@@ -8,6 +8,8 @@ var checks = new (string Name, Action Test)[]
     ("skipped devices never create phantom zones", Missing),
     ("room split never crosses into other room", SplitRooms),
     ("input ordering is deterministic", Deterministic),
+    ("room and device mutations update fingerprint", ChangedFingerprint),
+    ("far-away outlet cannot seize another room", RejectDistantOutlet),
     ("invalid placements are rejected", RejectInvalid)
 };
 int fails = 0;
@@ -82,6 +84,24 @@ static void Deterministic()
     var two = RoomControlSnapshotBuilder.Build(20, 1, rooms, b, 5);
     Require(one.Fingerprint == two.Fingerprint, "Fingerprint depends on device iteration order.");
     Require(one.Anchors.SequenceEqual(two.Anchors), "Resolved anchors vary by order.");
+}
+static void ChangedFingerprint()
+{
+    var original = RoomControlSnapshotBuilder.Build(3, 1, new[] { 1, 1, 1 },
+        [new ControllerPlacement(11, 0, 1)]);
+    var split = RoomControlSnapshotBuilder.Build(3, 1, new[] { 1, 1, 2 },
+        [new ControllerPlacement(11, 0, 1)]);
+    var moved = RoomControlSnapshotBuilder.Build(3, 1, new[] { 1, 1, 1 },
+        [new ControllerPlacement(11, 2, 1)]);
+    Require(original.Fingerprint != split.Fingerprint, "Room split was not detected.");
+    Require(original.Fingerprint != moved.Fingerprint, "Device position was not detected.");
+}
+static void RejectDistantOutlet()
+{
+    var snapshot = RoomControlSnapshotBuilder.Build(5, 1, new[] { 1, 1, -1, 2, 2 },
+        [new ControllerPlacement(12, 0, 3)]);
+    Require(snapshot.Anchors[0].CellIndex == 0,
+        "A non-adjacent preferred outlet must be ignored.");
 }
 static void RejectInvalid()
 {

@@ -21,3 +21,10 @@ jobs:
         run: dotnet run --project tests/Muqet.Adapter.Tests/Muqet.Adapter.Tests.csproj --configuration Release
       - name: Compile native Waylith 1.7 adapter
         run: dotnet build src/Muqet.RimWorld/Muqet.RimWorld.csproj --configuration Release
+      - name: Assert packaged assemblies exclude game and Harmony dependencies
+        run: |
+          test -s Mod/1.7/Assemblies/Muqet.RimWorld.dll
+          test -s Mod/1.7/Assemblies/Muqet.Thermal.dll
+          test ! -e Mod/1.7/Assemblies/0Harmony.dll
+          test ! -e Mod/1.7/Assemblies/Assembly-CSharp.dll
+          test ! -e Mod/1.7/Assemblies/Waylith.dll
