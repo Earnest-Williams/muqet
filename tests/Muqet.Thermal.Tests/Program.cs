@@ -31,6 +31,10 @@ var tests = new (string Name, Action Run)[]
     ("prepared cache sparse invalidation", PreparedSparse),
     ("prepared cache rejects stale and invalid edits", PreparedInvalid),
     ("failed thermal advance preserves published state", AdvanceTransactional),
+    ("definition memoization including negative hits", DefinitionMemo),
+    ("definition flush and transactional rebuild", DefinitionRefresh),
+    ("room measurement generation cache", RoomMemo),
+    ("room cache rejects bad topology and snapshots", RoomMemoInvalid),
 };
 
 int failures = 0;
@@ -601,4 +605,72 @@ static void AdvanceTransactional()
         Near(20, g.AirTemperatureC[0]);
         Near(20, g.AirTemperatureC[1]);
     }
+}
+
+
+static void DefinitionMemo()
+{
+    var c = new ThermalDefinitionCache<string>();
+    int hits = 0;
+    True(c.TryGetThing(12, 21, (_, _) => { hits++; return "wood"; }, out var one) && one == "wood", "First resolution.");
+    True(c.TryGetThing(12, 21, (_, _) => throw new Exception("Repeated resolution"), out var two) && two == "wood", "Cached.");
+    True(!c.TryGetThing(12, 22, (_, _) => { hits++; return null; }, out _), "Missing value.");
+    True(!c.TryGetThing(12, 22, (_, _) => throw new Exception("Negative miss repeated"), out _), "Negative cache.");
+    True(c.TryGetTerrain(7, _ => { hits++; return "granite"; }, out _), "Terrain lookup.");
+    True(c.TryGetTerrain(7, _ => throw new Exception("Repeated terrain resolution"), out _), "Terrain cache.");
+    True(hits == 3 && c.Hits == 3 && c.Misses == 3 && c.NegativeHits == 1, "Counters.");
+    True(c.ThingMaterialEntries == 2 && c.TerrainEntries == 1, "Entry count.");
+}
+
+static void DefinitionRefresh()
+{
+    var c = new ThermalDefinitionCache<string>();
+    c.ReplaceTerrain(new Dictionary<ushort, string?> { [1] = "A", [2] = null });
+    long gen = c.Generation;
+    Throws<ArgumentException>(() => c.ReplaceTerrain(new[]
+    {
+        new KeyValuePair<ushort, string?>(1, "B"),
+        new KeyValuePair<ushort, string?>(1, "C")
+    }));
+    True(c.Generation == gen && c.TryGetTerrain(1, _ => "WRONG", out var x) && x == "A",
+        "Failed terrain replacement must preserve prior values.");
+    c.Flush();
+    True(c.Generation == gen + 1 && c.TerrainEntries == 0, "Flush must invalidate values.");
+}
+
+static void RoomMemo()
+{
+    var c = new RoomTemperatureCache();
+    c.SetTopology(5, new Dictionary<int, int[]> { [4] = [0, 1, 2, 3, 4] });
+    c.PublishTemperatureGeneration(1);
+    float[] original = [16, 18, 20, 22, 24];
+    var a = c.ReadRoom(4, original);
+    Near(20, a.MeanC);
+    Near(16.8, a.ColdP10C);
+    True(c.ComputedSamples == 1, "First sample calculated.");
+    var b = c.ReadRoom(4, original);
+    Near(a.MeanC, b.MeanC);
+    True(c.CacheHits == 1 && c.ComputedSamples == 1, "Same generation uses cache.");
+    original[0] = 40;
+    // A published snapshot must be immutable within one generation.
+    Near(20, c.ReadRoom(4, original).MeanC);
+    c.PublishTemperatureGeneration(2);
+    Near(24.8, c.ReadRoom(4, original).MeanC);
+    True(c.ComputedSamples == 2, "New generation recomputes.");
+}
+
+static void RoomMemoInvalid()
+{
+    var c = new RoomTemperatureCache();
+    c.SetTopology(3, new Dictionary<int, int[]> { [1] = [0, 1] });
+    c.PublishTemperatureGeneration(1);
+    Throws<ArgumentException>(() => c.SetTopology(3, new Dictionary<int, int[]>
+    {
+        [1] = [0, 1], [2] = [1, 2]
+    }));
+    True(c.RoomCount == 1, "Bad topology must not replace a good cache.");
+    Throws<ArgumentException>(() => c.ReadRoom(1, [12]));
+    Throws<ArgumentOutOfRangeException>(() => c.PublishTemperatureGeneration(1));
+    Throws<KeyNotFoundException>(() => c.ReadRoom(8, [15, 15, 15]));
+    Near(15, c.ReadRoom(1, [15, 15, 15]).MeanC);
 }
