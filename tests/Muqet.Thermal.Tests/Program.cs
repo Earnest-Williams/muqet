@@ -380,9 +380,9 @@ static void ZoneMeasurement()
     Near(2, layout.Zones[0].EnvelopeConductanceWPerK, 0.000001);
     var measured = layout.MeasureZone(0, [16, 18, 20, 22, 24]);
     Near(16, measured.MinimumC);
-    Near(17.6, measured.ColdP10C);
+    Near(16.8, measured.ColdP10C);
     Near(20, measured.MeanC);
-    Near(22.4, measured.HotP90C);
+    Near(23.2, measured.HotP90C);
     Near(24, measured.MaximumC);
     Throws<ArgumentException>(() => layout.MeasureZone(0, [16, 18, 20]));
     Throws<ArgumentOutOfRangeException>(() => layout.ZoneIndexAt(-1));
