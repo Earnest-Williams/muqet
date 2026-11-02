@@ -22,6 +22,11 @@ var tests = new (string Name, Action Run)[]
     ("walls and reduced permeability restrict service", ZonePassages),
     ("zone temperatures and envelope losses", ZoneMeasurement),
     ("invalid zone topology rejected", ZoneInvalid),
+    ("thermostat band and hysteresis", ThermostatHysteresis),
+    ("remote tier relaxation", ThermostatTiers),
+    ("core prevents local overheating", ThermostatGuard),
+    ("heating and cooling conflicts", ThermostatConflict),
+    ("thermostat inputs validated", ThermostatValidation),
 };
 
 int failures = 0;
@@ -402,4 +407,82 @@ static void ZoneInvalid()
         [new ControlAnchor(1, 1, 0)], 0));
     Throws<ArgumentException>(() => VirtualControlZoneBuilder.Build(2, 2, room,
         [new ControlAnchor(1, 1, 0)], eastPermeability: [0, 1, 0, 0]));
+}
+
+
+static VirtualControlZoneLayout OneZone(int size) =>
+    VirtualControlZoneBuilder.Build(size, 1, Enumerable.Repeat(0, size).ToArray(),
+        [new ControlAnchor(1, 0, 0)]);
+
+static void ThermostatHysteresis()
+{
+    var layout = OneZone(5);
+    var control = new ZoneThermostat(1, new ThermostatBand(19, 23), ThermostatCapabilities.Heating);
+    True(control.Evaluate(layout, [18, 18, 18, 18, 18]).RequestHeating, "Cold zone starts heating.");
+    True(control.Evaluate(layout, [19.5f, 19.5f, 19.5f, 19.5f, 19.5f]).RequestHeating,
+        "Within hysteresis heating remains enabled.");
+    True(!control.Evaluate(layout, [20, 20, 20, 20, 20]).RequestHeating,
+        "Upper hysteresis threshold stops heating.");
+    True(!control.Evaluate(layout, [19.5f, 19.5f, 19.5f, 19.5f, 19.5f]).RequestHeating,
+        "Device stays idle until temperature falls below 19.");
+    control.Reset();
+    True(!control.HeatingActive, "Reset clears state.");
+}
+
+static void ThermostatTiers()
+{
+    var room = Enumerable.Repeat(0, 50).ToArray();
+    var layout = VirtualControlZoneBuilder.Build(50, 1, room,
+        [new ControlAnchor(1, 0, 0)]);
+    True(layout.Zones.Count == 2, "Expected two 25-cell zones.");
+    var temps = Enumerable.Repeat(21f, 50).ToArray();
+    for (int i = 25; i < 50; i++) temps[i] = 19f;
+    var control = new ZoneThermostat(1, new ThermostatBand(20, 23), ThermostatCapabilities.Heating);
+    True(!control.Evaluate(layout, temps).RequestHeating,
+        "Tier one is allowed a one-degree lower mean.");
+    for (int i = 25; i < 50; i++) temps[i] = 18.5f;
+    True(control.Evaluate(layout, temps).RequestHeating,
+        "Tier one demands heat below relaxed minimum while core is safe.");
+}
+
+static void ThermostatGuard()
+{
+    var layout = VirtualControlZoneBuilder.Build(50, 1,
+        Enumerable.Repeat(0, 50).ToArray(), [new ControlAnchor(1, 0, 0)]);
+    var temps = Enumerable.Repeat(25f, 50).ToArray();
+    for (int i = 25; i < 50; i++) temps[i] = 12f;
+    var controller = new ZoneThermostat(1, new ThermostatBand(19, 23), ThermostatCapabilities.Heating);
+    var d = controller.Evaluate(layout, temps);
+    True(!d.RequestHeating && d.HeatingLimitedByCore, "Hot core blocks remote heating demand.");
+}
+
+static void ThermostatConflict()
+{
+    var layout = VirtualControlZoneBuilder.Build(75, 1,
+        Enumerable.Repeat(0, 75).ToArray(), [new ControlAnchor(1, 0, 0)]);
+    var temps = Enumerable.Repeat(21f, 75).ToArray();
+    for (int i = 25; i < 50; i++) temps[i] = 12f;
+    for (int i = 50; i < 75; i++) temps[i] = 35f;
+    var controller = new ZoneThermostat(1, new ThermostatBand(19, 23),
+        ThermostatCapabilities.HeatingAndCooling);
+    var d = controller.Evaluate(layout, temps);
+    True(d.OpposingZoneDemands && !d.RequestHeating && !d.RequestCooling,
+        "Single dual-mode controller cannot chase conflicting remote demands at once.");
+    True(d.SampledZones == 3, "Thermostat sees all assigned tiers.");
+}
+
+static void ThermostatValidation()
+{
+    Throws<ArgumentException>(() => new ThermostatBand(23, 19).Validate());
+    Throws<ArgumentException>(() => new ThermostatBand(19, 23, 6).Validate());
+    Throws<ArgumentException>(() => new ThermostatBand(19, 23, 1, -1).Validate());
+    Throws<ArgumentOutOfRangeException>(() =>
+        new ZoneThermostat(-1, new ThermostatBand(19, 23), ThermostatCapabilities.Heating));
+    Throws<ArgumentOutOfRangeException>(() =>
+        new ZoneThermostat(1, new ThermostatBand(19, 23), (ThermostatCapabilities)8));
+    var thermostat = new ZoneThermostat(1, new ThermostatBand(19, 23), ThermostatCapabilities.Cooling);
+    var layout = OneZone(3);
+    Throws<ArgumentException>(() => thermostat.Evaluate(layout, [20, 20]));
+    Throws<InvalidOperationException>(() => new ZoneThermostat(7, new ThermostatBand(19, 23),
+        ThermostatCapabilities.Heating).Evaluate(layout, [20, 20, 20]));
 }
