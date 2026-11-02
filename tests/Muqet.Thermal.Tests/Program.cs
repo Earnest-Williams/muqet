@@ -16,6 +16,12 @@ var tests = new (string Name, Action Run)[]
     ("invalid properties are rejected", RejectInvalid),
     ("two backends with identical inputs are deterministic", Determinism),
     ("250x250 conservation regression", LargeMap),
+    ("zones cap at 25 and cover the room", ZoneCapacity),
+    ("zones are individually contiguous", ZoneConnectivity),
+    ("multi-controller assignment is deterministic", ZoneOwners),
+    ("walls and reduced permeability restrict service", ZonePassages),
+    ("zone temperatures and envelope losses", ZoneMeasurement),
+    ("invalid zone topology rejected", ZoneInvalid),
 };
 
 int failures = 0;
@@ -283,4 +289,117 @@ static void LargeMap()
     }
     Near(20, grid.AirTemperatureC[grid.Index(1, 1)]);
     True(grid.AirTemperatureC[grid.Index(125, 125)] < 100, "Hot cell did not diffuse.");
+}
+
+
+static void ZoneCapacity()
+{
+    var room = Enumerable.Repeat(4, 100).ToArray();
+    var layout = VirtualControlZoneBuilder.Build(10, 10, room, [new ControlAnchor(7, 4, 90)]);
+    True(layout.Zones.Count == 4, "100-cell room should produce four 25-cell zones.");
+    True(layout.UnservedCellCount == 0, "All room cells must be served.");
+    True(layout.Zones.All(z => z.Cells.Count == 25 && z.ControllerId == 7),
+        "Zones must have 25 cells and a common controller.");
+    for (int i = 0; i < 100; i++)
+        True(layout.ZoneIndexAt(i) >= 0 && layout.ControllerIdAt(i) == 7, "Lost room cell.");
+    for (int k = 0; k < 4; k++)
+        True(layout.Zones[k].Tier == k, "Tier must increase from the source.");
+}
+
+static void ZoneConnectivity()
+{
+    // U-shaped room, requiring paths that are not Euclidean-nearest.
+    var room = Enumerable.Repeat(-1, 9 * 9).ToArray();
+    for (int y = 0; y < 9; y++)
+    {
+        room[y * 9] = 2;
+        room[y * 9 + 8] = 2;
+    }
+    for (int x = 0; x < 9; x++) room[8 * 9 + x] = 2;
+    var layout = VirtualControlZoneBuilder.Build(9, 9, room, [new ControlAnchor(3, 2, 0)], 7);
+    True(layout.UnservedCellCount == 0, "U-shaped room cells should be reachable.");
+    foreach (var zone in layout.Zones)
+    {
+        True(zone.Cells.Count <= 7, "Zone exceeds capacity.");
+        var allowed = zone.Cells.ToHashSet();
+        var seen = new HashSet<int> { zone.Cells[0] };
+        var q = new Queue<int>();
+        q.Enqueue(zone.Cells[0]);
+        while (q.Count > 0)
+        {
+            int p = q.Dequeue(), x = p % 9;
+            var adjacent = new List<int>();
+            if (x > 0) adjacent.Add(p - 1);
+            if (x < 8) adjacent.Add(p + 1);
+            if (p >= 9) adjacent.Add(p - 9);
+            if (p < 72) adjacent.Add(p + 9);
+            foreach (int a in adjacent)
+                if (allowed.Contains(a) && seen.Add(a)) q.Enqueue(a);
+        }
+        True(seen.Count == allowed.Count, "Zone must be connected by cardinal paths.");
+    }
+}
+
+static void ZoneOwners()
+{
+    int[] room = Enumerable.Repeat(1, 10).ToArray();
+    var a = VirtualControlZoneBuilder.Build(10, 1, room,
+        [new ControlAnchor(20, 1, 9), new ControlAnchor(10, 1, 0)], 25);
+    var b = VirtualControlZoneBuilder.Build(10, 1, room,
+        [new ControlAnchor(10, 1, 0), new ControlAnchor(20, 1, 9)], 25);
+    for (int i = 0; i < 10; i++)
+    {
+        True(a.ControllerIdAt(i) == b.ControllerIdAt(i), "Anchor input order must not change assignment.");
+        True(a.ControllerIdAt(i) == (i < 5 ? 10 : 20), "Nearest controller should win.");
+    }
+    True(a.Zones.Count == 2 && a.Zones.All(z => z.Cells.Count == 5), "Two heaters split the room.");
+}
+
+static void ZonePassages()
+{
+    int[] room = Enumerable.Repeat(2, 6).ToArray();
+    float[] east = [1, 0, 1, 1, 1, 0];
+    var blocked = VirtualControlZoneBuilder.Build(6, 1, room,
+        [new ControlAnchor(1, 2, 0)], eastPermeability: east);
+    True(blocked.UnservedCellCount == 4, "Closed barrier disconnects four cells.");
+    True(blocked.ZoneIndexAt(2) == -1 && blocked.ControllerIdAt(2) == -1,
+        "Blocked cells cannot be silently assigned.");
+    east[1] = 0.2f;
+    var open = VirtualControlZoneBuilder.Build(6, 1, room,
+        [new ControlAnchor(1, 2, 0)], eastPermeability: east);
+    True(open.UnservedCellCount == 0, "Partially open passage reconnects the room.");
+    True(open.Zones.Count == 1, "One short corridor fits in one zone.");
+}
+
+static void ZoneMeasurement()
+{
+    int[] room = Enumerable.Repeat(0, 5).ToArray();
+    float[] loss = [0.2f, 0.3f, 0.4f, 0.5f, 0.6f];
+    var layout = VirtualControlZoneBuilder.Build(5, 1, room,
+        [new ControlAnchor(1, 0, 0)], envelopeLossWPerK: loss);
+    Near(2, layout.Zones[0].EnvelopeConductanceWPerK, 0.000001);
+    var measured = layout.MeasureZone(0, [16, 18, 20, 22, 24]);
+    Near(16, measured.MinimumC);
+    Near(17.6, measured.ColdP10C);
+    Near(20, measured.MeanC);
+    Near(22.4, measured.HotP90C);
+    Near(24, measured.MaximumC);
+    Throws<ArgumentException>(() => layout.MeasureZone(0, [16, 18, 20]));
+    Throws<ArgumentOutOfRangeException>(() => layout.ZoneIndexAt(-1));
+    True(!double.IsNaN(measured.MeanC), "Thermostat must be finite.");
+}
+
+static void ZoneInvalid()
+{
+    int[] room = Enumerable.Repeat(1, 4).ToArray();
+    Throws<ArgumentException>(() => VirtualControlZoneBuilder.Build(2, 2, room,
+        [new ControlAnchor(1, 2, 0)]));
+    Throws<ArgumentException>(() => VirtualControlZoneBuilder.Build(2, 2, room,
+        [new ControlAnchor(1, 1, 0), new ControlAnchor(1, 1, 1)]));
+    Throws<ArgumentException>(() => VirtualControlZoneBuilder.Build(2, 2, room,
+        [new ControlAnchor(1, 1, 0), new ControlAnchor(2, 1, 0)]));
+    Throws<ArgumentOutOfRangeException>(() => VirtualControlZoneBuilder.Build(2, 2, room,
+        [new ControlAnchor(1, 1, 0)], 0));
+    Throws<ArgumentException>(() => VirtualControlZoneBuilder.Build(2, 2, room,
+        [new ControlAnchor(1, 1, 0)], eastPermeability: [0, 1, 0, 0]));
 }
