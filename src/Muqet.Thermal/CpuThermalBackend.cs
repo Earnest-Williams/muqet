@@ -16,12 +16,25 @@ public sealed class CpuThermalBackend : IThermalBackend
     private readonly ThermalGrid grid;
     private readonly float[] nextAir;
     private readonly float[] nextSolid;
+    private readonly float[] stagedAir;
+    private readonly float[] stagedSolid;
+    private ThermalCoefficientCache? prepared;
 
     public CpuThermalBackend(ThermalGrid grid)
     {
         this.grid = grid ?? throw new ArgumentNullException(nameof(grid));
         nextAir = new float[grid.CellCount];
         nextSolid = new float[grid.CellCount];
+        stagedAir = new float[grid.CellCount];
+        stagedSolid = new float[grid.CellCount];
+    }
+
+    /// <summary>Enable opt-in structural caching. Structural edits require cache invalidation.</summary>
+    public ThermalCoefficientCache PrepareCoefficients()
+    {
+        prepared ??= new ThermalCoefficientCache(grid);
+        prepared.Refresh();
+        return prepared;
     }
 
     public int Width => grid.Width;
@@ -49,7 +62,9 @@ public sealed class CpuThermalBackend : IThermalBackend
             throw new ArgumentOutOfRangeException(nameof(outdoorTemperatureC));
 
         // Validate the mutable host-owned arrays and recompute the CFL bound. No allocation.
-        double maximumRate = ValidateAndFindMaximumRate();
+        double maximumRate = prepared is null
+            ? ValidateAndFindMaximumRate()
+            : ValidateDynamicStateAndGetPreparedRate();
         double before = grid.TotalEnergyJ();
         if (elapsedSeconds == 0)
             return new ThermalAdvanceResult(0, 0, before, before, 0, 0);
@@ -64,6 +79,7 @@ public sealed class CpuThermalBackend : IThermalBackend
         for (int i = 0; i < grid.CellCount; i++)
             sourceWatts += (double)grid.AirSourceW[i] + grid.SolidSourceW[i];
 
+        // Never write to published state until every substep has succeeded.
         float[] readAir = grid.AirTemperatureC;
         float[] readSolid = grid.SolidTemperatureC;
         float[] writeAir = nextAir;
@@ -78,57 +94,86 @@ public sealed class CpuThermalBackend : IThermalBackend
                 int x = i % width;
                 double air = readAir[i];
                 double solid = readSolid[i];
+                PreparedThermalCell p = prepared is null ? default : prepared[i];
+                float coupling = prepared is null ? grid.AirSolidWPerK[i] : p.AirSolid;
+                float outdoor = prepared is null ? grid.OutdoorWPerK[i] : p.Outdoor;
                 double airFlow = grid.AirSourceW[i]
-                    + grid.OutdoorWPerK[i] * (outdoorTemperatureC - air)
-                    + grid.AirSolidWPerK[i] * (solid - air);
-                double solidFlow = grid.SolidSourceW[i]
-                    + grid.AirSolidWPerK[i] * (air - solid);
+                    + outdoor * (outdoorTemperatureC - air)
+                    + coupling * (solid - air);
+                double solidFlow = grid.SolidSourceW[i] + coupling * (air - solid);
 
-                // Gather stencil: both cells see the same edge coefficient, so no
-                // atomic adds or order-sensitive scatter writes are needed on a GPU.
                 if (x > 0)
                 {
-                    airFlow += grid.AirEastWPerK[i - 1] * (readAir[i - 1] - air);
-                    solidFlow += grid.SolidEastWPerK[i - 1] * (readSolid[i - 1] - solid);
+                    float ae = prepared is null ? grid.AirEastWPerK[i - 1] : prepared[i - 1].AirEast;
+                    float se = prepared is null ? grid.SolidEastWPerK[i - 1] : prepared[i - 1].SolidEast;
+                    airFlow += ae * (readAir[i - 1] - air);
+                    solidFlow += se * (readSolid[i - 1] - solid);
                 }
                 if (x + 1 < width)
                 {
-                    airFlow += grid.AirEastWPerK[i] * (readAir[i + 1] - air);
-                    solidFlow += grid.SolidEastWPerK[i] * (readSolid[i + 1] - solid);
+                    float ae = prepared is null ? grid.AirEastWPerK[i] : p.AirEast;
+                    float se = prepared is null ? grid.SolidEastWPerK[i] : p.SolidEast;
+                    airFlow += ae * (readAir[i + 1] - air);
+                    solidFlow += se * (readSolid[i + 1] - solid);
                 }
                 if (i >= width)
                 {
-                    airFlow += grid.AirNorthWPerK[i - width] * (readAir[i - width] - air);
-                    solidFlow += grid.SolidNorthWPerK[i - width] * (readSolid[i - width] - solid);
+                    float an = prepared is null ? grid.AirNorthWPerK[i - width] : prepared[i - width].AirNorth;
+                    float sn = prepared is null ? grid.SolidNorthWPerK[i - width] : prepared[i - width].SolidNorth;
+                    airFlow += an * (readAir[i - width] - air);
+                    solidFlow += sn * (readSolid[i - width] - solid);
                 }
                 if (i + width < n)
                 {
-                    airFlow += grid.AirNorthWPerK[i] * (readAir[i + width] - air);
-                    solidFlow += grid.SolidNorthWPerK[i] * (readSolid[i + width] - solid);
+                    float an = prepared is null ? grid.AirNorthWPerK[i] : p.AirNorth;
+                    float sn = prepared is null ? grid.SolidNorthWPerK[i] : p.SolidNorth;
+                    airFlow += an * (readAir[i + width] - air);
+                    solidFlow += sn * (readSolid[i + width] - solid);
                 }
 
-                double updatedAir = air + h * airFlow / grid.AirCapacityJPerK[i];
-                double updatedSolid = grid.SolidCapacityJPerK[i] > 0
-                    ? solid + h * solidFlow / grid.SolidCapacityJPerK[i]
+                double updatedAir = air + h * airFlow / (prepared is null ? grid.AirCapacityJPerK[i] : p.AirCapacity);
+                double updatedSolid = (prepared is null ? grid.SolidCapacityJPerK[i] : p.SolidCapacity) > 0
+                    ? solid + h * solidFlow / (prepared is null ? grid.SolidCapacityJPerK[i] : p.SolidCapacity)
                     : solid;
                 if (!double.IsFinite(updatedAir) || !double.IsFinite(updatedSolid)
                     || updatedAir < -273.15 || updatedSolid < -273.15)
                     throw new InvalidOperationException($"Nonphysical temperature at cell {i}; check heat sources and timestep.");
                 writeAir[i] = (float)updatedAir;
                 writeSolid[i] = (float)updatedSolid;
-                outdoorJ += h * grid.OutdoorWPerK[i] * (outdoorTemperatureC - air);
+                outdoorJ += h * outdoor * (outdoorTemperatureC - air);
             }
-            (readAir, writeAir) = (writeAir, readAir);
-            (readSolid, writeSolid) = (writeSolid, readSolid);
+            readAir = writeAir;
+            readSolid = writeSolid;
+            writeAir = ReferenceEquals(readAir, nextAir) ? stagedAir : nextAir;
+            writeSolid = ReferenceEquals(readSolid, nextSolid) ? stagedSolid : nextSolid;
         }
 
-        if (!ReferenceEquals(readAir, grid.AirTemperatureC))
-            Array.Copy(readAir, grid.AirTemperatureC, n);
-        if (!ReferenceEquals(readSolid, grid.SolidTemperatureC))
-            Array.Copy(readSolid, grid.SolidTemperatureC, n);
+        // When the number of steps is even, the second private buffer is used.
+        // No substep ever targets the grid arrays.
+        Array.Copy(readAir, grid.AirTemperatureC, n);
+        Array.Copy(readSolid, grid.SolidTemperatureC, n);
 
         double after = grid.TotalEnergyJ();
         return new ThermalAdvanceResult(steps, elapsedSeconds, before, after, sourceWatts * elapsedSeconds, outdoorJ);
+    }
+
+    private double ValidateDynamicStateAndGetPreparedRate()
+    {
+        ThermalCoefficientCache cache = prepared!;
+        if (cache.HasPendingChanges)
+            throw new InvalidOperationException("Refresh invalidated coefficient changes before advancing.");
+        for (int i = 0; i < grid.CellCount; i++)
+        {
+            float air = grid.AirTemperatureC[i], solid = grid.SolidTemperatureC[i];
+            float airSource = grid.AirSourceW[i], solidSource = grid.SolidSourceW[i];
+            if (!float.IsFinite(air) || !float.IsFinite(solid)
+                || air < -273.15f || solid < -273.15f
+                || !float.IsFinite(airSource) || !float.IsFinite(solidSource))
+                throw new ArgumentException($"Invalid dynamic thermal state at cell {i}.");
+            if (cache[i].SolidCapacity == 0 && solidSource != 0)
+                throw new ArgumentException($"Inactive solid cell {i} has a source.");
+        }
+        return cache.MaximumOutgoingRate;
     }
 
     private double ValidateAndFindMaximumRate()
