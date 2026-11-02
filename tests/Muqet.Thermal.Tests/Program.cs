@@ -27,6 +27,10 @@ var tests = new (string Name, Action Run)[]
     ("core prevents local overheating", ThermostatGuard),
     ("heating and cooling conflicts", ThermostatConflict),
     ("thermostat inputs validated", ThermostatValidation),
+    ("prepared cache parity and idle reuse", PreparedParity),
+    ("prepared cache sparse invalidation", PreparedSparse),
+    ("prepared cache rejects stale and invalid edits", PreparedInvalid),
+    ("failed thermal advance preserves published state", AdvanceTransactional),
 };
 
 int failures = 0;
@@ -485,4 +489,116 @@ static void ThermostatValidation()
     Throws<ArgumentException>(() => thermostat.Evaluate(layout, [20, 20]));
     Throws<InvalidOperationException>(() => new ZoneThermostat(7, new ThermostatBand(19, 23),
         ThermostatCapabilities.Heating).Evaluate(layout, [20, 20, 20]));
+}
+
+
+static ThermalGrid PreparedFixture()
+{
+    var g = new ThermalGrid(11, 7, 15, 5);
+    for (int i = 0; i < g.CellCount; i++)
+    {
+        int x = i % g.Width;
+        g.AirTemperatureC[i] = 10 + (i % 21);
+        g.SolidTemperatureC[i] = 5 + (i % 15);
+        g.AirCapacityJPerK[i] = 20 + (i % 5);
+        g.SolidCapacityJPerK[i] = 50 + (i % 11);
+        g.AirSolidWPerK[i] = 0.4f;
+        g.OutdoorWPerK[i] = 0.02f;
+        g.AirSourceW[i] = i % 3 - 1;
+        if (x + 1 < g.Width)
+        {
+            g.AirEastWPerK[i] = 0.15f;
+            g.SolidEastWPerK[i] = 0.25f;
+        }
+        if (i + g.Width < g.CellCount)
+        {
+            g.AirNorthWPerK[i] = 0.17f;
+            g.SolidNorthWPerK[i] = 0.21f;
+        }
+    }
+    return g;
+}
+
+static void PreparedParity()
+{
+    var regular = PreparedFixture();
+    var cached = PreparedFixture();
+    var x = new CpuThermalBackend(regular);
+    var y = new CpuThermalBackend(cached);
+    var cache = y.PrepareCoefficients();
+    True(cache.LastCapturedCells == cached.CellCount, "First preparation captures all cells.");
+    for (int step = 0; step < 20; step++)
+    {
+        var a = x.Advance(0.3, -3);
+        var b = y.Advance(0.3, -3);
+        Near(a.EnergyResidualJ, b.EnergyResidualJ, 0.002);
+        True(a.Substeps == b.Substeps, "Prepared CFL bound must match reference.");
+        for (int i = 0; i < regular.CellCount; i++)
+        {
+            Near(regular.AirTemperatureC[i], cached.AirTemperatureC[i], 0.00001);
+            Near(regular.SolidTemperatureC[i], cached.SolidTemperatureC[i], 0.00001);
+        }
+    }
+    True(cache.Refresh() == 0, "Unchanged topology must not be recaptured.");
+    cache.AssertMatchesHost();
+}
+
+static void PreparedSparse()
+{
+    var g = PreparedFixture();
+    var backend = new CpuThermalBackend(g);
+    var cache = backend.PrepareCoefficients();
+    long before = cache.TotalCapturedCells;
+    g.AirEastWPerK[15] = 0.6f;
+    g.AirCapacityJPerK[16] = 50f;
+    cache.InvalidateCell(15);
+    cache.InvalidateCell(16);
+    Throws<InvalidOperationException>(() => backend.Advance(1, 4));
+    True(cache.Refresh() == 2, "Only two modified source cells must be recaptured.");
+    True(cache.TotalCapturedCells == before + 2, "Sparse capture counter mismatch.");
+    cache.AssertMatchesHost();
+    backend.Advance(1, 4);
+    var independent = PreparedFixture();
+    independent.AirEastWPerK[15] = 0.6f;
+    independent.AirCapacityJPerK[16] = 50f;
+    new CpuThermalBackend(independent).Advance(1, 4);
+    for (int i = 0; i < g.CellCount; i++)
+        Near(independent.AirTemperatureC[i], g.AirTemperatureC[i], 0.00001);
+}
+
+static void PreparedInvalid()
+{
+    var g = PreparedFixture();
+    var backend = new CpuThermalBackend(g);
+    var cache = backend.PrepareCoefficients();
+    g.AirNorthWPerK[0] = float.NaN;
+    cache.InvalidateCell(0);
+    Throws<ArgumentException>(() => cache.Refresh());
+    True(cache.HasPendingChanges, "Invalid batch must remain dirty.");
+    g.AirNorthWPerK[0] = 0.24f;
+    True(cache.Refresh() == 1, "Repaired cell should refresh.");
+    cache.AssertMatchesHost();
+    g.AirSourceW[0] = float.PositiveInfinity;
+    Throws<ArgumentException>(() => backend.Advance(1, 10));
+    g.AirSourceW[0] = 1;
+    g.AirEastWPerK[0] = 0.9f;
+    Throws<InvalidOperationException>(() => cache.AssertMatchesHost());
+}
+
+static void AdvanceTransactional()
+{
+    foreach (bool cachedMode in new[] { false, true })
+    {
+        var g = new ThermalGrid(2, 1, 20);
+        g.AirCapacityJPerK[0] = 1;
+        g.AirCapacityJPerK[1] = 1;
+        g.AirEastWPerK[0] = 1;
+        g.AirSourceW[0] = -500;
+        var backend = new CpuThermalBackend(g);
+        if (cachedMode) backend.PrepareCoefficients();
+        // A sufficiently high negative source produces a substep failure.
+        Throws<InvalidOperationException>(() => backend.Advance(1, 15));
+        Near(20, g.AirTemperatureC[0]);
+        Near(20, g.AirTemperatureC[1]);
+    }
 }
