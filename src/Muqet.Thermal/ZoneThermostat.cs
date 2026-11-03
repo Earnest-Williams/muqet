@@ -97,6 +97,15 @@ public sealed class ZoneThermostat
     public bool HeatingActive => heating;
     public bool CoolingActive => cooling;
 
+    /// <summary>Clone hysteresis without mutating a published controller if a frame fails.</summary>
+    public ZoneThermostat CopyState()
+    {
+        var copy = new ZoneThermostat(ControllerId, band, capabilities);
+        copy.heating = heating;
+        copy.cooling = cooling;
+        return copy;
+    }
+
     /// <summary>Reset on a control-group reconfiguration or a deliberate power-off.</summary>
     public void Reset()
     {
