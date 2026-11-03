@@ -23,6 +23,7 @@ internal sealed class NativeThermalShadow
     private ThermalGrid? grid;
     private HvacSimulationCoordinator? coordinator;
     private ulong roomFingerprint;
+    private ulong geometryFingerprint;
     private readonly Dictionary<int, ElectricThermalDeviceOutput> lastOutputs = new();
     private int previousTick = -1;
     private int lastLoggedTick = -1;
@@ -42,8 +43,16 @@ internal sealed class NativeThermalShadow
 
         try
         {
-            if (coordinator is null || roomFingerprint != snapshot.RoomFingerprint)
-                Initialize(snapshot, tick);
+            // Doors/roof changes need not change Room.Cells. Classify the
+            // current physical layout on each shadow step and reseed safely
+            // when its geometry signature changes.
+            var observedCells = new ShadowCell[snapshot.Zones.CellCount];
+            var observedTemperatures = new float[snapshot.Zones.CellCount];
+            RimWorldShadowCollector.Capture(map, observedCells, observedTemperatures);
+            ulong observedGeometry = Fingerprint(observedCells);
+            if (coordinator is null || roomFingerprint != snapshot.RoomFingerprint
+                || observedGeometry != geometryFingerprint)
+                Initialize(snapshot, tick, observedCells, observedTemperatures, observedGeometry);
 
             if (grid is null || coordinator is null)
                 return;
@@ -77,9 +86,7 @@ internal sealed class NativeThermalShadow
             // Only compare against a snapshot of actual vanilla temperatures.
             // Diagnostics are a divergence indicator, not a validation of
             // physical material calibration or absence of missing sources.
-            var current = new float[grid.CellCount];
-            var ignored = new ShadowCell[grid.CellCount];
-            RimWorldShadowCollector.Capture(map, ignored, current);
+            var current = observedTemperatures;
             double sum = 0;
             int sampled = 0;
             foreach (var room in snapshot.CreateRoomMembership())
@@ -109,17 +116,26 @@ internal sealed class NativeThermalShadow
         }
     }
 
-    private void Initialize(RoomControlSnapshot snapshot, int tick)
+    private static ulong Fingerprint(ReadOnlySpan<ShadowCell> cells)
     {
-        int n = snapshot.Zones.CellCount;
-        var cells = new ShadowCell[n];
-        var vanilla = new float[n];
-        RimWorldShadowCollector.Capture(map, cells, vanilla);
+        ulong hash = 14695981039346656037UL;
+        foreach (ShadowCell cell in cells)
+        {
+            hash = unchecked((hash ^ (byte)cell.Kind) * 1099511628211UL);
+            hash = unchecked((hash ^ (byte)cell.Roof) * 1099511628211UL);
+        }
+        return hash;
+    }
+
+    private void Initialize(RoomControlSnapshot snapshot, int tick,
+        ShadowCell[] cells, float[] vanilla, ulong observedGeometry)
+    {
         grid = ShadowThermalGridBuilder.Build(snapshot.Zones.Width, snapshot.Zones.Height,
             cells, vanilla, ShadowThermalCalibration.Provisional);
         coordinator = new HvacSimulationCoordinator(grid);
         coordinator.BindTopology(snapshot);
         roomFingerprint = snapshot.RoomFingerprint;
+        geometryFingerprint = observedGeometry;
         previousTick = tick;
         lastOutputs.Clear();
         LastRoomTemperatureMeanErrorC = double.NaN;
