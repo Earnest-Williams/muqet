@@ -21,6 +21,9 @@ public sealed class MuqetMapComponent : MapComponent
     public RoomControlSnapshot? Snapshot { get; private set; }
     public int SnapshotGeneration { get; private set; }
     public int LastCaptureTick { get; private set; }
+    /// <summary>Captured RimWorld room-cell membership, independent of controller positions.</summary>
+    public RoomTemperatureCache RoomTemperatures { get; } = new();
+    public int RoomMembershipRefreshes { get; private set; }
 
     public void MarkDirty() => dirty = true;
 
@@ -38,6 +41,11 @@ public sealed class MuqetMapComponent : MapComponent
             dirty = false;
             if (Snapshot != null && Snapshot.Fingerprint == captured.Fingerprint)
                 return;
+            if (Snapshot == null || Snapshot.RoomFingerprint != captured.RoomFingerprint)
+            {
+                RoomTemperatures.SetTopology(captured.Zones.CellCount, captured.CreateRoomMembership());
+                RoomMembershipRefreshes++;
+            }
             Snapshot = captured;
             SnapshotGeneration++;
             if (Prefs.DevMode)
