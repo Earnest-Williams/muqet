@@ -10,7 +10,10 @@ var checks = new (string Name, Action Test)[]
     ("input ordering is deterministic", Deterministic),
     ("room and device mutations update fingerprint", ChangedFingerprint),
     ("far-away outlet cannot seize another room", RejectDistantOutlet),
-    ("invalid placements are rejected", RejectInvalid)
+    ("invalid placements are rejected", RejectInvalid),
+    ("room membership independent of device movement", RoomMembership),
+    ("room membership snapshot is immutable", RoomMembershipImmutable),
+    ("membership can drive cached room statistics", RoomSampleIntegration)
 };
 int fails = 0;
 foreach (var (name, test) in checks)
@@ -114,4 +117,54 @@ static void RejectInvalid()
         [new ControllerPlacement(2, 0, 9)]));
     Reject<ArgumentException>(() => RoomControlSnapshotBuilder.Build(2, 1,
         new[] { 1 }, [new ControllerPlacement(2, 0, -1)]));
+}
+
+
+static void RoomMembership()
+{
+    int[] ids = [1, 1, -1, 2, 2];
+    var before = RoomControlSnapshotBuilder.Build(5, 1, ids,
+        [new ControllerPlacement(7, 0, 0)]);
+    var moved = RoomControlSnapshotBuilder.Build(5, 1, ids,
+        [new ControllerPlacement(7, 1, 1)]);
+    Require(before.RoomFingerprint == moved.RoomFingerprint,
+        "Moving a controller must not invalidate room-cell membership.");
+    Require(before.Fingerprint != moved.Fingerprint,
+        "Controller positions must invalidate control-zone placement.");
+    var memberships = before.CreateRoomMembership();
+    Require(memberships.Count == 2 && memberships[1].SequenceEqual([0, 1])
+        && memberships[2].SequenceEqual([3, 4]), "Wrong room membership.");
+    ids[0] = 3;
+    var changed = RoomControlSnapshotBuilder.Build(5, 1, ids,
+        [new ControllerPlacement(7, 1, 1)]);
+    Require(changed.RoomFingerprint != before.RoomFingerprint,
+        "Changing a room must invalidate membership.");
+}
+
+static void RoomMembershipImmutable()
+{
+    int[] ids = [1, 1, 1];
+    var snapshot = RoomControlSnapshotBuilder.Build(3, 1, ids,
+        [new ControllerPlacement(2, 0, 0)]);
+    ids[0] = 3;
+    Require(snapshot.RoomIdsByCell[0] == 1, "Snapshot must copy source room membership.");
+    Require(snapshot.CreateRoomMembership()[1].SequenceEqual([0, 1, 2]),
+        "Room-cell membership changed outside the snapshot.");
+}
+
+static void RoomSampleIntegration()
+{
+    var snap = RoomControlSnapshotBuilder.Build(5, 1, [1, 1, -1, 2, 2],
+        [new ControllerPlacement(3, 0, 0)]);
+    var cache = new RoomTemperatureCache();
+    cache.SetTopology(snap.Zones.CellCount, snap.CreateRoomMembership());
+    cache.PublishTemperatureGeneration(0);
+    var reading = cache.ReadRoom(1, [18, 22, 99, 8, 12]);
+    Require(Math.Abs(reading.MeanC - 20) < 1e-6, "Wrong room mean.");
+    Require(cache.RoomCount == 2 && cache.ComputedSamples == 1, "Room was not cached.");
+    Require(cache.ReadRoom(1, [18, 22, 99, 8, 12]) == reading && cache.CacheHits == 1,
+        "Repeated queries must reuse the same published generation.");
+    cache.PublishTemperatureGeneration(1);
+    Require(Math.Abs(cache.ReadRoom(1, [22, 22, 99, 8, 12]).MeanC - 22) < 1e-6,
+        "New temperature publication must refresh the room sample.");
 }
