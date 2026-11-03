@@ -35,6 +35,11 @@ var tests = new (string Name, Action Run)[]
     ("definition flush and transactional rebuild", DefinitionRefresh),
     ("room measurement generation cache", RoomMemo),
     ("room cache rejects bad topology and snapshots", RoomMemoInvalid),
+    ("heater energy and standby heat", HeaterEnergy),
+    ("cooler two-sided energy ledger", CoolerEnergy),
+    ("cooler hot-face lift and blocked ports", CoolerLift),
+    ("frame rebuild is atomic and nonaccumulating", DeviceFrame),
+    ("device model input validation", DeviceModelValidation),
 };
 
 int failures = 0;
@@ -673,4 +678,122 @@ static void RoomMemoInvalid()
     Throws<ArgumentOutOfRangeException>(() => c.PublishTemperatureGeneration(1));
     Throws<KeyNotFoundException>(() => c.ReadRoom(8, [15, 15, 15]));
     Near(15, c.ReadRoom(1, [15, 15, 15]).MeanC);
+}
+
+
+static ThermostatDecision Request(int id, bool heat = false, bool cool = false) =>
+    new(id, heat, cool, false, false, false, 1, 20, 20, 20, 0, 0);
+
+static void HeaterEnergy()
+{
+    var device = new ElectricThermalDevice(1, ElectricThermalDeviceKind.Heater, 0, -1,
+        new ElectricThermalDeviceProfile(500, 0.1f));
+    var heating = ElectricThermalDeviceModel.Evaluate(device, Request(1, heat: true),
+        powerOn: true, portsReady: true, [15f]);
+    Near(500, heating.ElectricalInputW);
+    Near(500, heating.IndoorHeatW);
+    Near(0, heating.ExhaustHeatW);
+    True(heating.ActivelyHeatingOrCooling, "Heat must be active.");
+    var standby = ElectricThermalDeviceModel.Evaluate(device, Request(1),
+        powerOn: true, portsReady: true, [15f]);
+    Near(50, standby.IndoorHeatW);
+    Near(50, standby.ElectricalInputW);
+    True(!standby.ActivelyHeatingOrCooling, "Standby is not heating mode.");
+    var off = ElectricThermalDeviceModel.Evaluate(device, Request(1, heat: true),
+        powerOn: false, portsReady: true, [15f]);
+    Near(0, off.TotalThermalW);
+    var blocked = ElectricThermalDeviceModel.Evaluate(device, Request(1, heat: true),
+        powerOn: true, portsReady: false, [15f]);
+    Near(50, blocked.TotalThermalW);
+    var cutoff = ElectricThermalDeviceModel.Evaluate(device, Request(1, heat: true),
+        powerOn: true, portsReady: true, [130f]);
+    True(!cutoff.ActivelyHeatingOrCooling, "Heater must respect safety cutoff.");
+}
+
+static void CoolerEnergy()
+{
+    var device = new ElectricThermalDevice(2, ElectricThermalDeviceKind.Cooler, 0, 1,
+        new ElectricThermalDeviceProfile(200, 0.1f, 3, 90));
+    var running = ElectricThermalDeviceModel.Evaluate(device, Request(2, cool: true),
+        powerOn: true, portsReady: true, [20f, 20f]);
+    Near(200, running.ElectricalInputW);
+    Near(-600, running.IndoorHeatW);
+    Near(800, running.ExhaustHeatW);
+    Near(200, running.TotalThermalW);
+    Near(3, running.CoolingCop);
+    True(running.ActivelyHeatingOrCooling, "Cooler must run.");
+    var grid = new ThermalGrid(2, 1, 20);
+    grid.AirCapacityJPerK[0] = grid.AirCapacityJPerK[1] = 1000;
+    ElectricThermalSourceFrame.Apply(grid, new float[2], [running]);
+    var result = new CpuThermalBackend(grid).Advance(0.1, 20);
+    Near(200 * 0.1, result.SourceEnergyJ, 0.001);
+    Conserved(result, 0.001);
+    Near(19.94, grid.AirTemperatureC[0], 0.00001);
+    Near(20.08, grid.AirTemperatureC[1], 0.00001);
+    var standby = ElectricThermalDeviceModel.Evaluate(device, Request(2),
+        powerOn: true, portsReady: true, [20f, 40f]);
+    Near(20, standby.ElectricalInputW);
+    Near(0, standby.IndoorHeatW);
+    Near(20, standby.ExhaustHeatW);
+    Near(20, standby.TotalThermalW);
+}
+
+static void CoolerLift()
+{
+    var d = new ElectricThermalDevice(4, ElectricThermalDeviceKind.Cooler, 0, 1,
+        new ElectricThermalDeviceProfile(250, 0.1f, 4, 80));
+    var cooled = ElectricThermalDeviceModel.Evaluate(d, Request(4, cool: true),
+        true, true, [20f, 60f]);
+    Near(2, cooled.CoolingCop);
+    Near(-500, cooled.IndoorHeatW);
+    Near(750, cooled.ExhaustHeatW);
+    var impossible = ElectricThermalDeviceModel.Evaluate(d, Request(4, cool: true),
+        true, true, [20f, 100f]);
+    True(!impossible.ActivelyHeatingOrCooling, "Maximum thermal lift blocks cooling.");
+    Near(25, impossible.ExhaustHeatW);
+    var closed = ElectricThermalDeviceModel.Evaluate(d, Request(4, cool: true),
+        true, false, [20f, 30f]);
+    True(!closed.ActivelyHeatingOrCooling, "Blocked ports must stop heat transport.");
+    var naturallyCool = ElectricThermalDeviceModel.Evaluate(d, Request(4, cool: true),
+        true, true, [30f, 0f]);
+    Near(4, naturallyCool.CoolingCop);
+}
+
+static void DeviceFrame()
+{
+    var grid = new ThermalGrid(3, 1);
+    float[] baseline = [12f, 3f, -1f];
+    var heater = new ElectricThermalDeviceOutput(1, 0, -1, 50, 50, 0, true, 0);
+    var cooler = new ElectricThermalDeviceOutput(2, 1, 2, 10, -30, 40, true, 3);
+    ElectricThermalSourceFrame.Apply(grid, baseline, [heater, cooler]);
+    Near(62, grid.AirSourceW[0]);
+    Near(-27, grid.AirSourceW[1]);
+    Near(39, grid.AirSourceW[2]);
+    ElectricThermalSourceFrame.Apply(grid, baseline, [heater, cooler]);
+    Near(62, grid.AirSourceW[0]); // must not accumulate twice
+    float[] snapshot = (float[])grid.AirSourceW.Clone();
+    Throws<ArgumentException>(() => ElectricThermalSourceFrame.Apply(grid, baseline,
+        [heater, new ElectricThermalDeviceOutput(2, 1, 2, 10, -500, 40, true, 1)]));
+    for (int i = 0; i < 3; i++)
+        Near(snapshot[i], grid.AirSourceW[i]);
+    ElectricThermalSourceFrame.Apply(grid, baseline, []);
+    Near(12, grid.AirSourceW[0]);
+    Near(3, grid.AirSourceW[1]);
+    Near(-1, grid.AirSourceW[2]);
+}
+
+static void DeviceModelValidation()
+{
+    Throws<ArgumentException>(() => new ElectricThermalDeviceProfile(0, .1f).Validate());
+    Throws<ArgumentException>(() => new ElectricThermalDeviceProfile(100, -1).Validate());
+    Throws<ArgumentException>(() => new ElectricThermalDevice(1,
+        ElectricThermalDeviceKind.Cooler, 0, 0,
+        new ElectricThermalDeviceProfile(200, .1f)).Validate(2));
+    var heater = new ElectricThermalDevice(1,
+        ElectricThermalDeviceKind.Heater, 0, -1, new ElectricThermalDeviceProfile(150, .1f));
+    Throws<ArgumentException>(() => ElectricThermalDeviceModel.Evaluate(heater,
+        Request(2, heat: true), true, true, [20f]));
+    var grid = new ThermalGrid(1, 1);
+    Throws<ArgumentException>(() => ElectricThermalSourceFrame.Apply(grid, grid.AirSourceW, []));
+    Throws<ArgumentException>(() => ElectricThermalSourceFrame.Apply(grid, [float.PositiveInfinity], []));
 }
