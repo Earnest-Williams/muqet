@@ -40,6 +40,10 @@ var tests = new (string Name, Action Run)[]
     ("cooler hot-face lift and blocked ports", CoolerLift),
     ("frame rebuild is atomic and nonaccumulating", DeviceFrame),
     ("device model input validation", DeviceModelValidation),
+    ("HVAC integrated heating publication", HvacIntegratedHeating),
+    ("HVAC integrated cooling and exhaust", HvacIntegratedCooling),
+    ("HVAC failing frames preserve published state", HvacRollback),
+    ("HVAC topology and request validation", HvacTopology),
 };
 
 int failures = 0;
@@ -796,4 +800,100 @@ static void DeviceModelValidation()
     var grid = new ThermalGrid(1, 1);
     Throws<ArgumentException>(() => ElectricThermalSourceFrame.Apply(grid, grid.AirSourceW, []));
     Throws<ArgumentException>(() => ElectricThermalSourceFrame.Apply(grid, [float.PositiveInfinity], []));
+}
+
+
+static HvacSimulationCoordinator HvacFixture(ThermalGrid grid, params ControllerPlacement[] placements)
+{
+    var membership = Enumerable.Repeat(1, grid.CellCount).ToArray();
+    var layout = RoomControlSnapshotBuilder.Build(grid.Width, grid.Height, membership, placements);
+    var coordinator = new HvacSimulationCoordinator(grid);
+    coordinator.BindTopology(layout);
+    return coordinator;
+}
+
+static void HvacIntegratedHeating()
+{
+    var grid = new ThermalGrid(3, 1, 15);
+    for (int i = 0; i < 3; i++) grid.AirCapacityJPerK[i] = 100;
+    var coordinator = HvacFixture(grid, new ControllerPlacement(4, 0, 0));
+    var heater = new ElectricThermalDevice(4, ElectricThermalDeviceKind.Heater, 0, -1,
+        new ElectricThermalDeviceProfile(200, .1f));
+    var request = new HvacDeviceRequest(heater, 21, true, true);
+    var step = coordinator.Advance(.1, 15, [request], new float[3]);
+    Near(20, step.Thermal.SourceEnergyJ, .0001);
+    Near(20, step.ElectricalEnergyJ, .0001);
+    Conserved(step.Thermal, .001);
+    Near(15.2, grid.AirTemperatureC[0], .00001);
+    True(step.Devices[0].ActivelyHeatingOrCooling, "Heating must run below the temperature band.");
+    True(step.PublishedGeneration == 0, "First publication is generation zero.");
+    var copy = new float[3];
+    coordinator.CopyPublishedAirTemperatures(copy);
+    Near(15.2, copy[0], .00001);
+    Near((15.2 + 15 + 15) / 3, coordinator.ReadRoom(1).MeanC, .00001);
+
+    var next = coordinator.Advance(.1, 15, [request], new float[3]);
+    True(next.PublishedGeneration == 1, "Completed frame increments published generation.");
+    Near(20, next.ElectricalEnergyJ, .001);
+    True(coordinator.RoomTemperatures.TemperatureGeneration == 1,
+        "Room measurements share published generation.");
+}
+
+static void HvacIntegratedCooling()
+{
+    var grid = new ThermalGrid(3, 1, 30);
+    for (int i = 0; i < 3; i++) grid.AirCapacityJPerK[i] = 1000;
+    var c = HvacFixture(grid, new ControllerPlacement(8, 0, 0));
+    var cooler = new ElectricThermalDevice(8, ElectricThermalDeviceKind.Cooler, 0, 2,
+        new ElectricThermalDeviceProfile(200, .1f, 3, 90));
+    var step = c.Advance(.5, 30, [new HvacDeviceRequest(cooler, 20, true, true)], new float[3]);
+    True(step.Devices[0].ActivelyHeatingOrCooling, "Cooler must request active power.");
+    Near(-600, step.Devices[0].IndoorHeatW, .01);
+    Near(800, step.Devices[0].ExhaustHeatW, .01);
+    Near(100, step.ElectricalEnergyJ, .0001);
+    Conserved(step.Thermal, .005);
+    Near(29.7, grid.AirTemperatureC[0], .00001);
+    Near(30.4, grid.AirTemperatureC[2], .00001);
+}
+
+static void HvacRollback()
+{
+    var grid = new ThermalGrid(2, 1, 20);
+    grid.AirCapacityJPerK[0] = 1;
+    grid.AirCapacityJPerK[1] = 1;
+    grid.AirEastWPerK[0] = 1;
+    grid.AirSourceW[0] = 4;
+    var c = HvacFixture(grid, new ControllerPlacement(7, 0, 0));
+    var heater = new ElectricThermalDevice(7, ElectricThermalDeviceKind.Heater, 0, -1,
+        new ElectricThermalDeviceProfile(10, 0));
+    Throws<InvalidOperationException>(() => c.Advance(1, 20,
+        [new HvacDeviceRequest(heater, 30, true, true)], [-500f, 0f]));
+    True(c.PublishedGeneration == -1, "Failed advance must not publish temperatures.");
+    Near(20, grid.AirTemperatureC[0]);
+    Near(4, grid.AirSourceW[0]);
+    Throws<InvalidOperationException>(() => c.CopyPublishedAirTemperatures(new float[2]));
+
+    var good = c.Advance(.1, 20, [new HvacDeviceRequest(heater, 30, true, true)], new float[2]);
+    True(good.PublishedGeneration == 0 && good.Devices[0].ActivelyHeatingOrCooling,
+        "Good frame after failed frame must start from unchanged hysteresis.");
+}
+
+static void HvacTopology()
+{
+    var grid = new ThermalGrid(2, 1, 20);
+    var c = new HvacSimulationCoordinator(grid);
+    var heater = new ElectricThermalDevice(5, ElectricThermalDeviceKind.Heater, 1, -1,
+        new ElectricThermalDeviceProfile(100, .1f));
+    Throws<InvalidOperationException>(() => c.Advance(1, 20,
+        [new HvacDeviceRequest(heater, 25, true, true)], new float[2]));
+    var snap = RoomControlSnapshotBuilder.Build(2, 1, [1, 1],
+        [new ControllerPlacement(5, 0, 0)]);
+    c.BindTopology(snap);
+    Throws<ArgumentException>(() => c.Advance(1, 20,
+        [new HvacDeviceRequest(heater, 25, true, true)], new float[2]));
+    var correct = heater with { IndoorCell = 0 };
+    Throws<ArgumentException>(() => c.Advance(1, 20,
+        [new HvacDeviceRequest(correct, 25, true, true),
+         new HvacDeviceRequest(correct, 25, true, true)], new float[2]));
+    True(c.PublishedGeneration == -1, "Bad requests must not publish.");
 }
