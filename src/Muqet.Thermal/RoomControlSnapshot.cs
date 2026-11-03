@@ -15,20 +15,46 @@ public readonly record struct ControllerPlacement(
 public sealed class RoomControlSnapshot
 {
     private readonly IReadOnlyList<ControlAnchor> anchors;
+    private readonly int[] roomIds;
+    private readonly IReadOnlyList<int> exposedRoomIds;
 
     internal RoomControlSnapshot(VirtualControlZoneLayout zones, ControlAnchor[] resolved,
-        int skippedDeviceCount, ulong fingerprint)
+        int skippedDeviceCount, ulong fingerprint, ulong roomFingerprint, int[] roomIdsByCell)
     {
         Zones = zones;
         anchors = Array.AsReadOnly(resolved);
+        roomIds = roomIdsByCell;
+        exposedRoomIds = Array.AsReadOnly(roomIds);
         SkippedDeviceCount = skippedDeviceCount;
         Fingerprint = fingerprint;
+        RoomFingerprint = roomFingerprint;
     }
 
     public VirtualControlZoneLayout Zones { get; }
     public IReadOnlyList<ControlAnchor> Anchors => anchors;
     public int SkippedDeviceCount { get; }
     public ulong Fingerprint { get; }
+    /// <summary>Independent of equipment positions, enabling room-cache reuse on device movement.</summary>
+    public ulong RoomFingerprint { get; }
+    public IReadOnlyList<int> RoomIdsByCell => exposedRoomIds;
+
+    /// <summary>Build room-cell membership once when RoomFingerprint changes; never per temperature query.</summary>
+    public IReadOnlyDictionary<int, int[]> CreateRoomMembership()
+    {
+        var gathered = new Dictionary<int, List<int>>();
+        for (int i = 0; i < roomIds.Length; i++)
+        {
+            int roomId = roomIds[i];
+            if (roomId < 0) continue;
+            if (!gathered.TryGetValue(roomId, out List<int>? cells))
+            {
+                cells = new List<int>();
+                gathered.Add(roomId, cells);
+            }
+            cells.Add(i);
+        }
+        return gathered.ToDictionary(x => x.Key, x => x.Value.ToArray());
+    }
 }
 
 /// <summary>
@@ -72,8 +98,9 @@ public static class RoomControlSnapshotBuilder
         void Mix(int value) { hash = unchecked((hash ^ (uint)value) * 1099511628211UL); }
         Mix(width);
         Mix(height);
-        Mix(maxCellsPerZone);
         foreach (int roomId in roomIds) Mix(roomId);
+        ulong roomFingerprint = hash;
+        Mix(maxCellsPerZone);
 
         for (int i = 0; i < ordered.Length; i++)
         {
@@ -103,7 +130,8 @@ public static class RoomControlSnapshotBuilder
         ControlAnchor[] resolvedAnchors = anchors.ToArray();
         VirtualControlZoneLayout zones = VirtualControlZoneBuilder.Build(
             width, height, roomIds, resolvedAnchors, maxCellsPerZone);
-        return new RoomControlSnapshot(zones, resolvedAnchors, skipped, hash);
+        return new RoomControlSnapshot(zones, resolvedAnchors, skipped, hash,
+            roomFingerprint, roomIds);
     }
 
     private static int ChooseFreeCell(ControllerPlacement device, int width, int height,
