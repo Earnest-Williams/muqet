@@ -44,6 +44,9 @@ var tests = new (string Name, Action Run)[]
     ("HVAC integrated cooling and exhaust", HvacIntegratedCooling),
     ("HVAC failing frames preserve published state", HvacRollback),
     ("HVAC topology and request validation", HvacTopology),
+    ("shadow grid has symmetric edges and stable energy", ShadowGridEnergy),
+    ("shadow wall, door, and roof coefficients", ShadowGeometry),
+    ("shadow grid rejects unphysical calibration", ShadowInvalid),
 };
 
 int failures = 0;
@@ -896,4 +899,54 @@ static void HvacTopology()
         [new HvacDeviceRequest(correct, 25, true, true),
          new HvacDeviceRequest(correct, 25, true, true)], new float[2]));
     True(c.PublishedGeneration == -1, "Bad requests must not publish.");
+}
+
+
+static void ShadowGridEnergy()
+{
+    var p = ShadowThermalCalibration.Provisional;
+    ShadowCell[] geometry = Enumerable.Repeat(new ShadowCell(ShadowCellKind.OpenAir,
+        ShadowRoofKind.ThickRoof), 12).ToArray();
+    float[] temps = Enumerable.Range(0, 12).Select(i => (float)(15 + i)).ToArray();
+    var grid = ShadowThermalGridBuilder.Build(4, 3, geometry, temps, p);
+    True(grid.AirEastWPerK[3] == 0 && grid.AirNorthWPerK[8] == 0,
+        "Edges may not wrap rows or extend beyond the map.");
+    True(grid.AirEastWPerK[0] > 0 && grid.AirNorthWPerK[0] > 0, "Open room requires connected air.");
+    var result = new CpuThermalBackend(grid).Advance(.25, 21);
+    Conserved(result, .02);
+}
+
+static void ShadowGeometry()
+{
+    var p = ShadowThermalCalibration.Provisional;
+    ShadowCell[] cells =
+    [
+        new(ShadowCellKind.OpenAir, ShadowRoofKind.Unroofed),
+        new(ShadowCellKind.ClosedDoor, ShadowRoofKind.ThinRoof),
+        new(ShadowCellKind.SolidBarrier, ShadowRoofKind.ThickRoof),
+        new(ShadowCellKind.OpenDoor, ShadowRoofKind.ThinRoof)
+    ];
+    var grid = ShadowThermalGridBuilder.Build(4, 1, cells, [20f, 20f, 20f, 20f], p);
+    Near(p.ClosedDoorPassageWPerK, grid.AirEastWPerK[0]);
+    Near(p.BarrierPassageWPerK, grid.AirEastWPerK[1]);
+    Near(p.BarrierPassageWPerK, grid.AirEastWPerK[2]);
+    Near(p.UnroofedOutdoorWPerK, grid.OutdoorWPerK[0]);
+    Near(p.ThinRoofOutdoorWPerK, grid.OutdoorWPerK[1]);
+    Near(p.ThickRoofOutdoorWPerK, grid.OutdoorWPerK[2]);
+    Near(p.BarrierSolidCapacityJPerK, grid.SolidCapacityJPerK[2]);
+    Near(20, grid.AirTemperatureC[0]);
+}
+
+static void ShadowInvalid()
+{
+    var c = ShadowThermalCalibration.Provisional;
+    Throws<ArgumentException>(() => ShadowThermalGridBuilder.Build(2, 1,
+        [new(ShadowCellKind.OpenAir, ShadowRoofKind.ThinRoof)],
+        [20f], c));
+    Throws<ArgumentException>(() => ShadowThermalGridBuilder.Build(1, 1,
+        [new(ShadowCellKind.OpenAir, ShadowRoofKind.ThinRoof)],
+        [float.NaN], c));
+    Throws<ArgumentException>(() => ShadowThermalGridBuilder.Build(1, 1,
+        [new(ShadowCellKind.OpenAir, ShadowRoofKind.ThinRoof)],
+        [20f], c with { CellAirCapacityJPerK = 0 }));
 }
