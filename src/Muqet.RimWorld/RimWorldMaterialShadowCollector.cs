@@ -124,11 +124,13 @@ internal static class RimWorldMaterialShadowCollector
                 : roof.isThickRoof ? ShadowRoofKind.ThickRoof : ShadowRoofKind.ThinRoof;
 
             bool barrier = kind is ShadowCellKind.SolidBarrier or ShadowCellKind.ClosedDoor;
-            BulkThermalMaterial structural = barrier && edifice is not null
-                ? resolver.Structure(edifice) : default;
-            float thickness = barrier && edifice is not null
+            BulkThermalMaterial structural = barrier
+                ? edifice is not null
+                    ? resolver.Structure(edifice) : ShadowBulkMaterialDefaults.Rock
+                : default;
+            float thickness = barrier
                 ? door is not null ? 0.18f
-                : edifice.def.building?.isNaturalRock == true ? 1.25f : 0.35f
+                : edifice?.def.building?.isNaturalRock == true ? 1.25f : 0.35f
                 : 0;
 
             BulkThermalMaterial roofMaterial = roof is null
