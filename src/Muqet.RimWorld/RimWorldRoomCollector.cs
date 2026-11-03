@@ -45,7 +45,14 @@ internal static class RimWorldRoomCollector
                 || basePos.z < 0 || basePos.z >= height)
                 continue;
 
-            IntVec3 facing = basePos + thing.Rotation.FacingCell;
+            // Heater control is local. Vanilla coolers extract heat from their
+            // rotated SOUTH face; the facing/NORTH side is hot exhaust, not a
+            // valid cold-room control anchor. Keep generic modded equipment's
+            // original facing-cell heuristic until its ports are profiled.
+            IntVec3 facing = thing is Building_Cooler
+                ? basePos + IntVec3.South.RotatedBy(thing.Rotation)
+                : thing is Building_Heater ? basePos
+                : basePos + thing.Rotation.FacingCell;
             int outlet = facing.x >= 0 && facing.x < width
                 && facing.z >= 0 && facing.z < height
                 ? facing.z * width + facing.x : -1;
