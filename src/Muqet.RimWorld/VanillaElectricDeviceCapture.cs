@@ -1,3 +1,4 @@
+using HarmonyLib;
 using Muqet.Thermal;
 using RimWorld;
 using Verse;
@@ -40,7 +41,7 @@ public static class VanillaElectricDeviceCapture
         if (control is null || power is null)
             return false;
 
-        float activeW = power.Props.basePowerConsumption;
+        float activeW = ResolveRatedElectricalWatts(power, control);
         float idleFactor = control.Props.lowPowerConsumptionFactor;
         float target = control.targetTemperature;
         if (!float.IsFinite(activeW) || activeW <= 0
@@ -72,6 +73,29 @@ public static class VanillaElectricDeviceCapture
         observation = new VanillaElectricDeviceObservation(device, target,
             power.PowerOn && !building.IsBrokenDown(), coldValid && hotValid);
         return true;
+    }
+
+    private static float ResolveRatedElectricalWatts(CompPowerTrader power, CompTempControl control)
+    {
+        // The 1.7 Waylith reference assemblies do not expose the old
+        // CompProperties_Power.basePowerConsumption field at compile time.
+        // Resolve a known runtime name; if unavailable, reconstruct nominal
+        // draw from actual consumption and the current low/high power mode.
+        var props = power.Props;
+        var field = AccessTools.Field(props.GetType(), "basePowerConsumption")
+            ?? AccessTools.Field(props.GetType(), "powerConsumption");
+        if (field?.GetValue(props) is float configured && configured > 0)
+            return configured;
+        var property = AccessTools.Property(props.GetType(), "basePowerConsumption")
+            ?? AccessTools.Property(props.GetType(), "PowerConsumption");
+        if (property?.GetValue(props) is float propertyW && propertyW > 0)
+            return propertyW;
+
+        float observedW = Math.Max(0f, -power.PowerOutput);
+        if (control.operatingAtHighPower)
+            return observedW;
+        float idleFraction = control.Props.lowPowerConsumptionFactor;
+        return idleFraction > 0 ? observedW / idleFraction : 0f;
     }
 
     /// <summary>
