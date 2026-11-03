@@ -47,6 +47,10 @@ var tests = new (string Name, Action Run)[]
     ("shadow grid has symmetric edges and stable energy", ShadowGridEnergy),
     ("shadow wall, door, and roof coefficients", ShadowGeometry),
     ("shadow grid rejects unphysical calibration", ShadowInvalid),
+    ("material density and thickness govern heat capacity", MaterialCapacity),
+    ("material thermal resistance and mountain roofs", MaterialConductance),
+    ("material-aware grid energy conservation", MaterialConservation),
+    ("invalid material fields fail without state mutation", MaterialInvalid),
 };
 
 int failures = 0;
@@ -949,4 +953,81 @@ static void ShadowInvalid()
     Throws<ArgumentException>(() => ShadowThermalGridBuilder.Build(1, 1,
         [new(ShadowCellKind.OpenAir, ShadowRoofKind.ThinRoof)],
         [20f], c with { CellAirCapacityJPerK = 0 }));
+}
+
+
+static MaterialShadowCell SampleMaterialCell(ShadowCellKind kind = ShadowCellKind.OpenAir,
+    ShadowRoofKind roof = ShadowRoofKind.Unroofed,
+    BulkThermalMaterial? structure = null, float thickness = 0.35f)
+{
+    return new MaterialShadowCell(kind, roof, ShadowBulkMaterialDefaults.Soil,
+        structure ?? ShadowBulkMaterialDefaults.Wood,
+        ShadowBulkMaterialDefaults.Rock, thickness, roof == ShadowRoofKind.Unroofed ? 0 : 1.5f);
+}
+
+static void MaterialCapacity()
+{
+    var calibration = MaterialShadowCalibration.Provisional;
+    var wood = SampleMaterialCell(ShadowCellKind.SolidBarrier, structure: ShadowBulkMaterialDefaults.Wood);
+    var granite = SampleMaterialCell(ShadowCellKind.SolidBarrier, structure: ShadowBulkMaterialDefaults.Rock);
+    var grid = MaterialShadowGridBuilder.Build(2, 1, [wood, granite], [20f, 20f], calibration);
+    True(grid.SolidCapacityJPerK[1] > grid.SolidCapacityJPerK[0],
+        "Equal-thickness rock must have greater thermal mass than wood.");
+    var thick = granite with { StructureThicknessM = 0.7f };
+    var doubled = MaterialShadowGridBuilder.Build(1, 1, [thick], [20f], calibration);
+    Near(grid.SolidCapacityJPerK[1] + 0.35 * granite.Structure.VolumetricCapacityJPerM3K,
+        doubled.SolidCapacityJPerK[0], 0.5);
+}
+
+static void MaterialConductance()
+{
+    var c = MaterialShadowCalibration.Provisional;
+    var air = SampleMaterialCell();
+    var timber = SampleMaterialCell(ShadowCellKind.SolidBarrier, structure: ShadowBulkMaterialDefaults.Wood);
+    var metal = SampleMaterialCell(ShadowCellKind.SolidBarrier, structure: ShadowBulkMaterialDefaults.Metal);
+    var wallWood = MaterialShadowGridBuilder.Build(2, 1, [air, timber], [20f, 10f], c);
+    var wallMetal = MaterialShadowGridBuilder.Build(2, 1, [air, metal], [20f, 10f], c);
+    True(wallWood.AirEastWPerK[0] < wallMetal.AirEastWPerK[0],
+        "Metal conducts heat faster than a timber barrier.");
+    True(wallWood.AirEastWPerK[0] < c.AirMixingWPerK,
+        "Barrier conduction must not be treated as open airflow.");
+
+    var mountain = SampleMaterialCell(roof: ShadowRoofKind.ThickRoof);
+    var thin = mountain with { Roof = ShadowRoofKind.ThinRoof, RoofActiveDepthM = 0.18f };
+    var roofs = MaterialShadowGridBuilder.Build(2, 1, [mountain, thin], [20f, 20f], c);
+    Near(0, roofs.OutdoorWPerK[0], 0);
+    True(roofs.OutdoorWPerK[1] > 0, "Constructed roof must exchange with external weather.");
+    True(roofs.SolidCapacityJPerK[0] > roofs.SolidCapacityJPerK[1],
+        "Mountain roof represents more thermal inertia than an exposed thin roof.");
+}
+
+static void MaterialConservation()
+{
+    var c = MaterialShadowCalibration.Provisional;
+    MaterialShadowCell[] cells =
+    [
+        SampleMaterialCell(),
+        SampleMaterialCell(ShadowCellKind.ClosedDoor, structure: ShadowBulkMaterialDefaults.Metal),
+        SampleMaterialCell(ShadowCellKind.SolidBarrier, structure: ShadowBulkMaterialDefaults.Wood),
+        SampleMaterialCell(roof: ShadowRoofKind.ThinRoof)
+    ];
+    var grid = MaterialShadowGridBuilder.Build(4, 1, cells, [30f, 20f, 10f, 0f], c);
+    var outflow = new CpuThermalBackend(grid).Advance(1, 0);
+    Conserved(outflow, 0.03);
+    var doors = MaterialShadowGridBuilder.Build(2, 1,
+        [SampleMaterialCell(), SampleMaterialCell(ShadowCellKind.ClosedDoor)],
+        [20f, 15f], c);
+    True(doors.AirEastWPerK[0] < c.AirMixingWPerK,
+        "Closed doors must not behave like unobstructed room air.");
+}
+
+static void MaterialInvalid()
+{
+    var c = MaterialShadowCalibration.Provisional;
+    var bad = SampleMaterialCell(ShadowCellKind.SolidBarrier) with { StructureThicknessM = 0 };
+    Throws<ArgumentException>(() => MaterialShadowGridBuilder.Build(1, 1, [bad], [20f], c));
+    var invalid = SampleMaterialCell() with { Terrain = new BulkThermalMaterial(float.NaN, 1_000f) };
+    Throws<ArgumentException>(() => MaterialShadowGridBuilder.Build(1, 1, [invalid], [20f], c));
+    Throws<ArgumentException>(() => MaterialShadowGridBuilder.Build(1, 1,
+        [SampleMaterialCell()], [20f], c with { SurfaceFilmWPerM2K = 0 }));
 }
