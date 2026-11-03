@@ -24,6 +24,7 @@ internal sealed class NativeThermalShadow
     private HvacSimulationCoordinator? coordinator;
     private ulong roomFingerprint;
     private ulong geometryFingerprint;
+    private readonly RimWorldMaterialResolver materialResolver = new();
     private readonly Dictionary<int, ElectricThermalDeviceOutput> lastOutputs = new();
     private int previousTick = -1;
     private int lastLoggedTick = -1;
@@ -46,9 +47,10 @@ internal sealed class NativeThermalShadow
             // Doors/roof changes need not change Room.Cells. Classify the
             // current physical layout on each shadow step and reseed safely
             // when its geometry signature changes.
-            var observedCells = new ShadowCell[snapshot.Zones.CellCount];
+            var observedCells = new MaterialShadowCell[snapshot.Zones.CellCount];
             var observedTemperatures = new float[snapshot.Zones.CellCount];
-            RimWorldShadowCollector.Capture(map, observedCells, observedTemperatures);
+            RimWorldMaterialShadowCollector.Capture(map, materialResolver,
+                observedCells, observedTemperatures);
             ulong observedGeometry = Fingerprint(observedCells);
             if (coordinator is null || roomFingerprint != snapshot.RoomFingerprint
                 || observedGeometry != geometryFingerprint)
@@ -116,22 +118,31 @@ internal sealed class NativeThermalShadow
         }
     }
 
-    private static ulong Fingerprint(ReadOnlySpan<ShadowCell> cells)
+    private static ulong Fingerprint(ReadOnlySpan<MaterialShadowCell> cells)
     {
         ulong hash = 14695981039346656037UL;
-        foreach (ShadowCell cell in cells)
+        void Mix(int value) => hash = unchecked((hash ^ (uint)value) * 1099511628211UL);
+        foreach (MaterialShadowCell cell in cells)
         {
-            hash = unchecked((hash ^ (byte)cell.Kind) * 1099511628211UL);
-            hash = unchecked((hash ^ (byte)cell.Roof) * 1099511628211UL);
+            Mix((byte)cell.Kind);
+            Mix((byte)cell.Roof);
+            Mix(BitConverter.SingleToInt32Bits(cell.Terrain.ConductivityWPerMK));
+            Mix(BitConverter.SingleToInt32Bits(cell.Terrain.VolumetricCapacityJPerM3K));
+            Mix(BitConverter.SingleToInt32Bits(cell.Structure.ConductivityWPerMK));
+            Mix(BitConverter.SingleToInt32Bits(cell.Structure.VolumetricCapacityJPerM3K));
+            Mix(BitConverter.SingleToInt32Bits(cell.RoofMaterial.ConductivityWPerMK));
+            Mix(BitConverter.SingleToInt32Bits(cell.RoofMaterial.VolumetricCapacityJPerM3K));
+            Mix(BitConverter.SingleToInt32Bits(cell.StructureThicknessM));
+            Mix(BitConverter.SingleToInt32Bits(cell.RoofActiveDepthM));
         }
         return hash;
     }
 
     private void Initialize(RoomControlSnapshot snapshot, int tick,
-        ShadowCell[] cells, float[] vanilla, ulong observedGeometry)
+        MaterialShadowCell[] cells, float[] vanilla, ulong observedGeometry)
     {
-        grid = ShadowThermalGridBuilder.Build(snapshot.Zones.Width, snapshot.Zones.Height,
-            cells, vanilla, ShadowThermalCalibration.Provisional);
+        grid = MaterialShadowGridBuilder.Build(snapshot.Zones.Width, snapshot.Zones.Height,
+            cells, vanilla, MaterialShadowCalibration.Provisional);
         coordinator = new HvacSimulationCoordinator(grid);
         coordinator.BindTopology(snapshot);
         roomFingerprint = snapshot.RoomFingerprint;
