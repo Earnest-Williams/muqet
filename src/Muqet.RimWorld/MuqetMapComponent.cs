@@ -15,6 +15,7 @@ public sealed class MuqetMapComponent : MapComponent
     private bool dirty = true;
     private int nextPollTick;
     private int retryAfterTick;
+    private NativeThermalShadow? shadow;
 
     public MuqetMapComponent(Map map) : base(map) { }
 
@@ -24,12 +25,22 @@ public sealed class MuqetMapComponent : MapComponent
     /// <summary>Captured RimWorld room-cell membership, independent of controller positions.</summary>
     public RoomTemperatureCache RoomTemperatures { get; } = new();
     public int RoomMembershipRefreshes { get; private set; }
+    /// <summary>Shadow is independent of the game temperature grid; -1 until first step.</summary>
+    public long ShadowGeneration => shadow?.PublishedGeneration ?? -1;
+    public double ShadowMeanAbsoluteDeltaC => shadow?.LastRoomTemperatureMeanErrorC ?? double.NaN;
+    public string? ShadowFailure => shadow?.LastFailure;
 
     public void MarkDirty() => dirty = true;
 
     public override void MapComponentTick()
     {
         int tick = Find.TickManager.TicksGame;
+        if (Snapshot is not null)
+        {
+            shadow ??= new NativeThermalShadow(map);
+            shadow.Run(tick, Snapshot);
+        }
+
         if (tick < retryAfterTick || (!dirty && tick < nextPollTick))
             return;
         nextPollTick = tick + SafetyPollTicks;
@@ -47,6 +58,7 @@ public sealed class MuqetMapComponent : MapComponent
                 RoomMembershipRefreshes++;
             }
             Snapshot = captured;
+            shadow?.TopologyChanged(captured);
             SnapshotGeneration++;
             if (Prefs.DevMode)
                 Log.Message($"[Muqet] map topology generation {SnapshotGeneration}: "
